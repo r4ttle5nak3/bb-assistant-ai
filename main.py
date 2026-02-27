@@ -19,6 +19,8 @@ class AgentState(TypedDict):
     program_handle: str
     program_name: str
     program_content: str
+    # new field for structured scopes returned by HackerOne
+    program_scopes: list[dict]
     findings: list[str]
     summary: str
 
@@ -63,6 +65,26 @@ def fetch_program_details(handle: str, auth: tuple[str, str]) -> dict | None:
         return None
 
 
+def fetch_program_scopes(handle: str, auth: tuple[str, str]) -> list[dict] | None:
+    """Retrieve structured scope information for a given program.
+
+    Uses the endpoint described in the HackerOne API docs:
+    https://api.hackerone.com/hacker-resources/#programs-get-structured-scopes
+
+    Returns a list of scope objects or None on failure.
+    """
+    url = f"https://api.hackerone.com/v1/hackers/programs/{handle}/structured_scopes"
+    try:
+        response = requests.get(url, auth=auth, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        # the data is expected to be a list of scope items
+        return data.get("data", []) if isinstance(data, dict) else data
+    except requests.RequestException as e:
+        print(f"Error fetching structured scopes: {e}")
+        return None
+
+
 def get_llm():
     """Return a LangChain Chat model configured to use OpenRouter.
 
@@ -102,6 +124,7 @@ def fetch_hackerone_content(state: AgentState, auth: tuple[str, str]) -> AgentSt
 
     try:
         program = fetch_program_details(handle, auth)
+        scopes = fetch_program_scopes(handle, auth)
         if program:
             # Compile program info into readable content
             attrs = program.get("attributes", {})
@@ -115,6 +138,23 @@ Offers Bounties: {attrs.get('offers_bounties', False)}
 Open Scope: {attrs.get('open_scope', False)}
 Currency: {attrs.get('currency', 'N/A')}
 """
+            # include structured scopes if available
+            if scopes:
+                # normalize scopes so top-level dict holds the attributes for easier processing later
+                normalized = []
+                content += "\nStructured Scopes:\n"
+                for scope in scopes:
+                    attrs = scope.get("attributes") if isinstance(scope, dict) else None
+                    if attrs and isinstance(attrs, dict):
+                        normalized.append(attrs)
+                        # append a human-readable description
+                        content += json.dumps(attrs, indent=2) + "\n"
+                    else:
+                        normalized.append(scope)
+                        content += json.dumps(scope, indent=2) + "\n"
+                state["program_scopes"] = normalized
+            else:
+                state["program_scopes"] = []
             state["program_content"] = content
             print(f"✓ Successfully fetched program details ({len(content)} characters)")
             state["messages"].append(AIMessage(f"Fetched HackerOne program: {handle}"))
@@ -181,6 +221,31 @@ Format the response as bullet points for clarity."""
 def generate_report(state: AgentState, llm) -> AgentState:
     """Generate a professional markdown summary of the HackerOne program"""
     findings_text = "\n".join([str(f) for f in state["findings"]])
+
+    # build a markdown table of structured scopes if we have them
+    scope_table = ""
+    if state.get("program_scopes"):
+        scopes = state["program_scopes"]
+        # gather all keys for header
+        keys = []
+        for scope in scopes:
+            if isinstance(scope, dict):
+                for k in scope.keys():
+                    if k not in keys:
+                        keys.append(k)
+        # header row
+        header = " | ".join(keys)
+        separator = " | ".join(["---"] * len(keys))
+        rows = []
+        for scope in scopes:
+            if isinstance(scope, dict):
+                row = " | ".join(str(scope.get(k, "")) for k in keys)
+            else:
+                # fallback to string representation
+                row = str(scope)
+            rows.append(row)
+        scope_table = "\n".join([header, separator] + rows)
+
     prompt = f"""Create a professional, well-formatted Markdown summary of a HackerOne bug bounty program.
 
 IMPORTANT: Include COMPLETE and DETAILED Scope information. Do not omit any scope details.
@@ -196,6 +261,8 @@ Include these sections:
 - What is explicitly included in scope
 - Geographic or jurisdictional scope limits (if any)
 
+{('The following structured scope data MUST be included verbatim as a Markdown table in the "Scope & Assets" section. Do not alter the table structure or omit the data:\n' + scope_table) if scope_table else ''}
+
 ## Vulnerability Types Accepted
 ## Exclusions & Out of Scope
 ## Reward Structure
@@ -205,7 +272,7 @@ Include these sections:
 Program Analysis:
 {findings_text}
 
-Make it professional, concise, and actionable for security researchers. **Most importantly, do not abbreviate or generalize the Scope & Assets section - include all specific details.**"""
+Make it professional, concise, and actionable for security researchers. **Most importantly, do not abbreviate or generalize the Scope & Assets section - include all specific details and ensure the table is present if provided.**"""
     
     response = llm.invoke(prompt)
     state["messages"].append(response)
@@ -219,6 +286,45 @@ Make it professional, concise, and actionable for security researchers. **Most i
     return state
 
 
+def review_summary(state: AgentState) -> AgentState:
+    """Check generated summary meets formatting requirements.
+
+    Ensures all the required sections are present and that the structured
+    scope table appears when scope data is available.
+    """
+    summary = state.get("summary", "")
+    issues: list[str] = []
+
+    # check expected sections
+    required_sections = [
+        "# HackerOne Program Summary",
+        "## Scope & Assets",
+        "## Vulnerability Types Accepted",
+        "## Exclusions & Out of Scope",
+        "## Reward Structure",
+        "## Testing Guidelines",
+        "## Key Takeaways",
+    ]
+    for sect in required_sections:
+        if sect not in summary:
+            issues.append(f"Missing section: {sect}")
+
+    # if we fetched structured scopes, expect a markdown table
+    if state.get("program_scopes"):
+        # simple detection: presence of pipe-delimiters and separator
+        if "|" not in summary or "---" not in summary:
+            issues.append("Structured scope table not found in summary.")
+
+    if issues:
+        msg_text = "Summary review found issues:\n" + "\n".join(f"- {i}" for i in issues)
+    else:
+        msg_text = "Summary review passed all requirements."
+
+    print(msg_text)
+    state["messages"].append(AIMessage(msg_text))
+    return state
+
+
 def build_agent_graph(llm, auth: tuple[str, str]):
     """Build the LangGraph workflow"""
     workflow = StateGraph(AgentState)
@@ -228,13 +334,15 @@ def build_agent_graph(llm, auth: tuple[str, str]):
     workflow.add_node("analyze", lambda state: analyze_target(state, llm))
     workflow.add_node("extract", lambda state: search_vulnerabilities(state, llm))
     workflow.add_node("summarize", lambda state: generate_report(state, llm))
+    workflow.add_node("review", lambda state: review_summary(state))
     
     # Add edges - workflow sequence
     workflow.add_edge(START, "fetch")
     workflow.add_edge("fetch", "analyze")
     workflow.add_edge("analyze", "extract")
     workflow.add_edge("extract", "summarize")
-    workflow.add_edge("summarize", END)
+    workflow.add_edge("summarize", "review")
+    workflow.add_edge("review", END)
     
     # Compile the graph
     return workflow.compile()
@@ -358,6 +466,7 @@ def main():
         "program_handle": program_handle,
         "program_name": program_name,
         "program_content": "",
+        "program_scopes": [],
         "findings": [],
         "summary": ""
     }

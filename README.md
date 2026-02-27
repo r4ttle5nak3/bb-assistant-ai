@@ -23,6 +23,9 @@ This tool automates the tedious task of analyzing HackerOne bug bounty programs 
 2. **Analyze** - LLM identifies key vulnerability types, scope, restrictions
 3. **Extract** - Structured extraction of program details and guidelines
 4. **Summarize** - Generate professional Markdown reports with complete scope details
+5. **Review** - The agent validates the generated summary to ensure all required
+   sections are present and that any structured scope data is rendered as a
+   Markdown table (the agent will flag missing elements before finishing).
 
 ### 📄 Report Generation
 - Comprehensive program summaries with sections for:
@@ -34,6 +37,11 @@ This tool automates the tedious task of analyzing HackerOne bug bounty programs 
   - Testing Guidelines
   - Key Takeaways
 - Automatically saved to `hackerone_summary.md`
+
+### 🔎 Structured Scope Support
+
+- If structured scope data is available for a program, the agent will include
+   it in the generated report in a concise, tabular form.
 
 ## Requirements
 
@@ -71,6 +79,12 @@ The script will:
 3. Prompt you to select a program (or search by name/handle)
 4. Analyze the program with the LLM
 5. Generate and save a summary to `hackerone_summary.md`
+
+Additional behaviors:
+
+- The agent runs a final review of the generated summary and will print or
+   append messages indicating whether the report meets the formatting and
+   completeness requirements.
 
 ## Architecture
 
