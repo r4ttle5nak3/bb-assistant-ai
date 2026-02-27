@@ -178,15 +178,24 @@ Format the response as bullet points for clarity."""
     return state
 
 
-def generate_report(state: AgentState, llm: OpenRouter) -> AgentState:
+def generate_report(state: AgentState, llm) -> AgentState:
     """Generate a professional markdown summary of the HackerOne program"""
     findings_text = "\n".join([str(f) for f in state["findings"]])
     prompt = f"""Create a professional, well-formatted Markdown summary of a HackerOne bug bounty program.
+
+IMPORTANT: Include COMPLETE and DETAILED Scope information. Do not omit any scope details.
 
 Include these sections:
 # HackerOne Program Summary
 ## Overview
 ## Scope & Assets
+**REQUIRED**: Provide exhaustive details about:
+- All in-scope assets (domains, IPs, applications, APIs, Wildcards, etc.)
+- Asset types and categories
+- Scope limitations and boundaries
+- What is explicitly included in scope
+- Geographic or jurisdictional scope limits (if any)
+
 ## Vulnerability Types Accepted
 ## Exclusions & Out of Scope
 ## Reward Structure
@@ -196,7 +205,7 @@ Include these sections:
 Program Analysis:
 {findings_text}
 
-Make it professional, concise, and actionable for security researchers."""
+Make it professional, concise, and actionable for security researchers. **Most importantly, do not abbreviate or generalize the Scope & Assets section - include all specific details.**"""
     
     response = llm.invoke(prompt)
     state["messages"].append(response)
@@ -255,17 +264,81 @@ def main():
         name = attrs.get("name", prog.get("id"))
         handle = attrs.get("handle", "unknown")
         print(f"{idx}. {name} ({handle})")
+    print(f"{len(programs) + 1}. 🔍 Search for another program")
     
     # Let user choose
+    def find_programs_by_name(programs: list[dict], name: str) -> list[dict]:
+        """Return programs whose name contains the search string (case‑insensitive)."""
+        name_lower = name.lower()
+        return [p for p in programs if name_lower in p.get("attributes", {}).get("name", "").lower()]
+
+    def search_programs_via_hacktivity(query: str, auth: tuple[str, str]) -> list[dict]:
+        """Use the hacktivity endpoint to look for programs matching `query`.
+
+        The HackerOne hacktivity API supports a lucene-style `queryString`
+        that can filter on related program attributes. We pull out **unique**
+        programs from the returned hacktivity items so the caller can present
+        choices to the user.
+        """
+        url = "https://api.hackerone.com/v1/hackers/hacktivity"
+        params = {"queryString": query}
+        try:
+            resp = requests.get(url, auth=auth, params=params, timeout=10)
+            resp.raise_for_status()
+            items = resp.json().get("data", [])
+            programs = []
+            seen = set()
+            for item in items:
+                prog = item.get("relationships", {}).get("program", {}).get("data", {})
+                attrs = prog.get("attributes", {})
+                handle = attrs.get("handle")
+                name = attrs.get("name")
+                if handle and handle not in seen:
+                    seen.add(handle)
+                    programs.append({"attributes": {"handle": handle, "name": name}})
+            return programs
+        except requests.RequestException as e:
+            print(f"Error searching programs via hacktivity: {e}")
+            return []
+
     while True:
         try:
-            choice = input(f"\nChoose a program (1-{len(programs)}): ").strip()
+            choice = input(f"\nChoose a program (1-{len(programs) + 1}): ").strip()
             idx = int(choice) - 1
             if 0 <= idx < len(programs):
                 selected_program = programs[idx]
                 break
+            elif idx == len(programs):
+                # Search for another program by handle or name
+                query = input("Enter program handle or name to search: ").strip()
+                if not query:
+                    print("Search term cannot be empty.")
+                    continue
+
+                hack_matches = search_programs_via_hacktivity(query, auth)
+                print("Programs found via hacktivity search:")
+                for hi, prog in enumerate(hack_matches, 1):
+                    attrs = prog.get("attributes", {})
+                    print(f"{hi}. {attrs.get('name')} ({attrs.get('handle')})")
+                sel = input(f"Choose one (1-{len(hack_matches)}) or press enter to continue treating '{query}' as a handle: ").strip()
+                if sel.isdigit():
+                    sel_idx = int(sel) - 1
+                    if 0 <= sel_idx < len(hack_matches):
+                        selected_program = hack_matches[sel_idx]
+                        print(f"Selected program {selected_program.get('attributes', {}).get('name')} from hacktivity results")
+                        break
+
+                # if not found by any of the above, try direct handle lookup
+                print(f"\nSearching for program by handle: {query}...")
+                search_result = fetch_program_details(query, auth)
+                if search_result and "data" in search_result:
+                    selected_program = search_result["data"]
+                    break
+                else:
+                    print(f"Program '{query}' not found or you don't have access.")
+                    continue
             else:
-                print(f"Please enter a number between 1 and {len(programs)}")
+                print(f"Please enter a number between 1 and {len(programs) + 1}")
         except ValueError:
             print("Invalid input. Please enter a number.")
     
